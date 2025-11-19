@@ -1,17 +1,37 @@
-# server.py
-import asyncio, json, secrets, os
+import asyncio
+import json
+import secrets
+import os
+from typing import Optional
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 import uvicorn
 
 app = FastAPI()
 
-# --------- Parties classiques (rooms) ----------
-rooms = {}  # code -> {"a": ws1 or None, "b": ws2 or None, "names": {"a": str|None, "b": str|None}}
+# ========= Parties classiques (rooms de jeu 1v1) ========= #
 
-# --------- Lobby (joueurs en ligne) -----------
-# clé = WebSocket, valeur = {"id": str, "name": str, "status": str}
-lobby_users = {}
+# code -> {
+#   "a": ws ou None,
+#   "b": ws ou None,
+#   "names": {"a": str|None, "b": str|None}
+# }
+rooms = {}
+
+# ========= Lobby (joueurs en ligne) ========= #
+
+# Joueurs connectés au lobby.
+#   lobby_users[user_id] = {
+#       "id": user_id,
+#       "name": str,
+#       "status": str,
+#       "avatar": str,   # ex: "avatar_01"
+#   }
+lobby_users: dict[str, dict] = {}
+
+# Mapping websocket -> user_id
+ws_to_user_id: dict[WebSocket, str] = {}
 
 
 @app.get("/")
@@ -19,18 +39,18 @@ def health():
     return PlainTextResponse("ok")
 
 
-def new_code():
-    # ex: 'A3F1' (4 hex)
+def new_code() -> str:
+    """Génère un code de salle, ex: 'A3F1' (4 hex)."""
     return secrets.token_hex(2).upper()
 
 
 async def send(ws: WebSocket, type_, **data):
-    """Helper pour envoyer un message typé à un client."""
+    """Helper pour envoyer un message typé à un client de partie."""
     await ws.send_text(json.dumps({"type": type_, **data}))
 
 
 async def broadcast(code: str, msg: str):
-    """Broadcast dans une salle (partie à 2)."""
+    """Broadcast dans une salle de jeu (partie à 2)."""
     for k in ("a", "b"):
         ws = rooms[code].get(k)
         if ws:
@@ -40,13 +60,13 @@ async def broadcast(code: str, msg: str):
                 pass
 
 
-async def lobby_broadcast(payload: dict, exclude: WebSocket | None = None):
+async def lobby_broadcast(payload: dict, exclude: Optional[WebSocket] = None):
     """
     Broadcast d'un message de lobby (presence_delta, etc.)
     à tous les joueurs du lobby, sauf éventuellement `exclude`.
     """
     raw = json.dumps(payload)
-    for ws in list(lobby_users.keys()):
+    for ws in list(ws_to_user_id.keys()):
         if exclude is not None and ws is exclude:
             continue
         try:
@@ -54,6 +74,25 @@ async def lobby_broadcast(payload: dict, exclude: WebSocket | None = None):
         except Exception:
             # on ignore les erreurs réseau ponctuelles
             pass
+
+
+async def send_presence_snapshot_to(ws: WebSocket):
+    """
+    Envoie à un websocket le snapshot complet des autres joueurs du lobby.
+    On exclut le joueur lui-même de la liste et on lui donne son your_id.
+    """
+    user_id = ws_to_user_id.get(ws)
+    if not user_id:
+        # pas encore enregistré, rien à envoyer
+        return
+
+    others = [u for uid, u in lobby_users.items() if uid != user_id]
+    snapshot = {
+        "type": "presence_snapshot",
+        "your_id": user_id,  # permet au client de savoir qui il est
+        "users": others,
+    }
+    await ws.send_text(json.dumps(snapshot))
 
 
 @app.websocket("/ws")
@@ -72,47 +111,47 @@ async def ws_endpoint(ws: WebSocket):
             if t == "lobby_hello":
                 # Un client s'annonce dans le lobby
                 name = (msg.get("name") or "Joueur")[:20]
+                avatar = msg.get("avatar") or "avatar_01"
 
-                # Si ce websocket est déjà dans le lobby, on garde le même id
-                if ws in lobby_users:
-                    uid = lobby_users[ws]["id"]
-                else:
-                    uid = secrets.token_hex(4)
+                existing_id = ws_to_user_id.get(ws)
+                is_new = existing_id is None
+                user_id = existing_id or secrets.token_hex(4)
 
+                # Enregistrer / mettre à jour l'utilisateur
                 user = {
-                    "id": uid,
+                    "id": user_id,
                     "name": name,
-                    "status": "dispo",  # tu pourras affiner plus tard
+                    "status": "dispo",  # tu pourras gérer AFK, occupé, etc. plus tard
+                    "avatar": avatar,
                 }
-                lobby_users[ws] = user
+                lobby_users[user_id] = user
+                ws_to_user_id[ws] = user_id
 
-                # 1) envoyer au client un snapshot complet
-                snapshot = {
-                    "type": "presence_snapshot",
-                    "users": list(lobby_users.values()),
-                }
-                await ws.send_text(json.dumps(snapshot))
+                # 1) envoyer au client un snapshot des AUTRES
+                await send_presence_snapshot_to(ws)
 
-                # 2) prévenir les autres joueurs du lobby de l'arrivée
+                # 2) prévenir les autres joueurs du lobby de l'arrivée / mise à jour
                 delta = {
                     "type": "presence_delta",
-                    "added": [user],
+                    "added": [user] if is_new else [],
                     "removed": [],
-                    "updated": [],
+                    "updated": [] if is_new else [user],
                 }
                 await lobby_broadcast(delta, exclude=ws)
 
             elif t == "lobby_goodbye":
                 # Le client quitte volontairement le lobby
-                user = lobby_users.pop(ws, None)
-                if user:
-                    delta = {
-                        "type": "presence_delta",
-                        "added": [],
-                        "removed": [user],
-                        "updated": [],
-                    }
-                    await lobby_broadcast(delta, exclude=ws)
+                user_id = ws_to_user_id.pop(ws, None)
+                if user_id:
+                    user = lobby_users.pop(user_id, None)
+                    if user:
+                        delta = {
+                            "type": "presence_delta",
+                            "added": [],
+                            "removed": [user],
+                            "updated": [],
+                        }
+                        await lobby_broadcast(delta, exclude=ws)
 
             # (plus tard tu pourras ajouter lobby_invite / lobby_answer ici)
 
@@ -121,7 +160,7 @@ async def ws_endpoint(ws: WebSocket):
                 code = new_code()
                 while code in rooms:
                     code = new_code()
-                # NEW: stocke le nom du créateur (optionnel)
+
                 creator_name = (msg.get("name") or "J1")[:20]
                 rooms[code] = {
                     "a": ws,
@@ -140,11 +179,10 @@ async def ws_endpoint(ws: WebSocket):
                 spot = "a" if rooms[code]["a"] is None else "b"
                 rooms[code][spot] = ws
 
-                # NEW: stocke le nom du joueur qui rejoint
                 joiner_name = (
                     msg.get("name") or ("J2" if spot == "b" else "J1")
                 )[:20]
-                rooms[code]["names"][spot] = joiner_name  # NEW
+                rooms[code]["names"][spot] = joiner_name
 
                 role = spot
                 await send(ws, "room_joined", code=code, role=role)
@@ -159,7 +197,7 @@ async def ws_endpoint(ws: WebSocket):
                         json.dumps(
                             {
                                 "type": "start",
-                                "names": rooms[code]["names"],  # NEW
+                                "names": rooms[code]["names"],
                             }
                         ),
                     )
@@ -174,20 +212,22 @@ async def ws_endpoint(ws: WebSocket):
                 break
 
     except WebSocketDisconnect:
-        # déconnexion "normale"
+        # déconnexion "normale" / réseau
         pass
     finally:
         # ---------- Nettoyage lobby ----------
-        user = lobby_users.pop(ws, None)
-        if user:
-            delta = {
-                "type": "presence_delta",
-                "added": [],
-                "removed": [user],
-                "updated": [],
-            }
-            # on informe les autres qu'il a quitté le lobby
-            await lobby_broadcast(delta, exclude=ws)
+        user_id = ws_to_user_id.pop(ws, None)
+        if user_id:
+            user = lobby_users.pop(user_id, None)
+            if user:
+                delta = {
+                    "type": "presence_delta",
+                    "added": [],
+                    "removed": [user],
+                    "updated": [],
+                }
+                # on informe les autres qu'il a quitté le lobby
+                await lobby_broadcast(delta, exclude=ws)
 
         # ---------- Nettoyage rooms ----------
         if code and code in rooms:
