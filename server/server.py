@@ -17,7 +17,10 @@ app = FastAPI()
 #   "b": ws ou None,
 #   "names": {"a": str|None, "b": str|None}
 # }
-rooms = {}
+rooms: dict[str, dict] = {}
+
+# NOUVEAU : mapping websocket -> code de salle
+ws_to_room_code: dict[WebSocket, str] = {}
 
 # ========= Lobby (joueurs en ligne) ========= #
 
@@ -51,6 +54,8 @@ async def send(ws: WebSocket, type_, **data):
 
 async def broadcast(code: str, msg: str):
     """Broadcast dans une salle de jeu (partie à 2)."""
+    if code not in rooms:
+        return
     for k in ("a", "b"):
         ws = rooms[code].get(k)
         if ws:
@@ -95,11 +100,19 @@ async def send_presence_snapshot_to(ws: WebSocket):
     await ws.send_text(json.dumps(snapshot))
 
 
+def get_ws_by_user_id(user_id: str) -> Optional[WebSocket]:
+    """Retrouve le WebSocket correspondant à un user_id du lobby."""
+    for ws, uid in ws_to_user_id.items():
+        if uid == user_id:
+            return ws
+    return None
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     role = None
-    code = None
+    code: Optional[str] = None
 
     try:
         while True:
@@ -153,9 +166,101 @@ async def ws_endpoint(ws: WebSocket):
                         }
                         await lobby_broadcast(delta, exclude=ws)
 
-            # (plus tard tu pourras ajouter lobby_invite / lobby_answer ici)
+            # ---------- INVITATIONS (lobby_invite / lobby_answer) ----------
+            elif t == "invite":
+                # Le client (ws) invite un autre joueur à jouer
+                from_id = ws_to_user_id.get(ws)
+                if not from_id:
+                    continue
+                to_id = str(msg.get("to_id") or "")
+                if not to_id:
+                    continue
 
-            # ---------- PARTIES CLASSIQUES ----------
+                print(f"[SERVER] invite from {from_id} to {to_id}")
+
+                target_ws = get_ws_by_user_id(to_id)
+                if not target_ws:
+                    continue  # joueur plus là
+
+                from_user = lobby_users.get(from_id, {"name": "Joueur"})
+                payload = {
+                    "type": "invite_incoming",
+                    "from_id": from_id,
+                    "from_name": from_user.get("name") or "Joueur",
+                    "avatar": from_user.get("avatar") or "avatar_01",
+                }
+                await target_ws.send_text(json.dumps(payload))
+
+            elif t == "invite_reply":
+                # Un joueur accepte / refuse une invitation
+                from_id = ws_to_user_id.get(ws)
+                if not from_id:
+                    continue
+                to_id = str(msg.get("to_id") or "")
+                if not to_id:
+                    continue
+                accepted = bool(msg.get("accepted"))
+
+                print(f"[SERVER] invite_reply from {from_id} to {to_id}, accepted={accepted}")
+
+                inviter_ws = get_ws_by_user_id(to_id)
+                if not inviter_ws:
+                    continue  # l'autre n'est plus connecté
+
+                from_user = lobby_users.get(from_id, {"name": "Joueur"})
+                inviter_user = lobby_users.get(to_id, {"name": "Joueur"})
+
+                if not accepted:
+                    # Simple refus
+                    payload = {
+                        "type": "invite_declined",
+                        "from_id": from_id,
+                        "from_name": from_user.get("name") or "Joueur",
+                    }
+                    await inviter_ws.send_text(json.dumps(payload))
+                    continue
+
+                # Invitation acceptée -> création d'une salle et match_start pour les 2
+                code = new_code()
+                while code in rooms:
+                    code = new_code()
+
+                rooms[code] = {
+                    "a": inviter_ws,
+                    "b": ws,
+                    "names": {
+                        "a": inviter_user.get("name") or "J1",
+                        "b": from_user.get("name") or "J2",
+                    },
+                }
+                ws_to_room_code[inviter_ws] = code
+                ws_to_room_code[ws] = code
+
+                names = rooms[code]["names"]
+
+                # message match_start pour les 2 joueurs
+                await inviter_ws.send_text(
+                    json.dumps(
+                        {
+                            "type": "match_start",
+                            "code": code,
+                            "role": "a",
+                            "names": names,
+                        }
+                    )
+                )
+                await ws.send_text(
+                    json.dumps(
+                        {
+                            "type": "match_start",
+                            "code": code,
+                            "role": "b",
+                            "names": names,
+                        }
+                    )
+                )
+
+            # ---------- PARTIES CLASSIQUES (création/join par code) ----------
             elif t == "create_room":
                 code = new_code()
                 while code in rooms:
@@ -168,6 +273,7 @@ async def ws_endpoint(ws: WebSocket):
                     "names": {"a": creator_name, "b": None},
                 }
                 role = "a"
+                ws_to_room_code[ws] = code
                 await send(ws, "room_created", code=code, role=role)
 
             elif t == "join_room":
@@ -185,6 +291,7 @@ async def ws_endpoint(ws: WebSocket):
                 rooms[code]["names"][spot] = joiner_name
 
                 role = spot
+                ws_to_room_code[ws] = code
                 await send(ws, "room_joined", code=code, role=role)
 
                 # prévenir l'autre
@@ -203,9 +310,11 @@ async def ws_endpoint(ws: WebSocket):
                     )
 
             elif t in ("move", "chat", "ping"):
-                if not code:
+                # on retrouve le code de salle via le mapping global
+                room_code = ws_to_room_code.get(ws)
+                if not room_code:
                     continue
-                await broadcast(code, raw)
+                await broadcast(room_code, raw)
 
             elif t == "leave":
                 # côté client on ferme la partie
@@ -226,16 +335,16 @@ async def ws_endpoint(ws: WebSocket):
                     "removed": [user],
                     "updated": [],
                 }
-                # on informe les autres qu'il a quitté le lobby
                 await lobby_broadcast(delta, exclude=ws)
 
         # ---------- Nettoyage rooms ----------
-        if code and code in rooms:
+        room_code = ws_to_room_code.pop(ws, None)
+        if room_code and room_code in rooms:
             for k in ("a", "b"):
-                if rooms[code].get(k) is ws:
-                    rooms[code][k] = None
-            if not rooms[code]["a"] and not rooms[code]["b"]:
-                rooms.pop(code, None)
+                if rooms[room_code].get(k) is ws:
+                    rooms[room_code][k] = None
+            if not rooms[room_code]["a"] and not rooms[room_code]["b"]:
+                rooms.pop(room_code, None)
 
 
 if __name__ == "__main__":
