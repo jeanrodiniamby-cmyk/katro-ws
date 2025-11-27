@@ -337,14 +337,37 @@ async def ws_endpoint(ws: WebSocket):
                 }
                 await lobby_broadcast(delta, exclude=ws)
 
-        # ---------- Nettoyage rooms ----------
+        # ---------- Nettoyage rooms + notification à l'adversaire ----------
         room_code = ws_to_room_code.pop(ws, None)
         if room_code and room_code in rooms:
+            room = rooms[room_code]
+
+            # identifier l'autre joueur AVANT de nous enlever
+            other_ws = None
             for k in ("a", "b"):
-                if rooms[room_code].get(k) is ws:
-                    rooms[room_code][k] = None
-            if not rooms[room_code]["a"] and not rooms[room_code]["b"]:
+                ws_slot = room.get(k)
+                if ws_slot is not None and ws_slot is not ws:
+                    other_ws = ws_slot
+
+            # enlever ce websocket de la salle
+            for k in ("a", "b"):
+                if room.get(k) is ws:
+                    room[k] = None
+
+            # prévenir l'adversaire s'il est encore connecté
+            if other_ws is not None:
+                try:
+                    await other_ws.send_text(
+                        json.dumps({"type": "peer_left"})
+                    )
+                except Exception:
+                    # on ignore les erreurs réseau
+                    pass
+
+            # si la salle est maintenant vide, on la supprime
+            if not room.get("a") and not room.get("b"):
                 rooms.pop(room_code, None)
+
 
 
 if __name__ == "__main__":
