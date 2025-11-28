@@ -321,8 +321,44 @@ async def ws_endpoint(ws: WebSocket):
                 break
 
     except WebSocketDisconnect:
-        # déconnexion "normale" / réseau
-        pass
+        # --- Nouveau : gérer la sortie pendant une partie ---
+        if ws in ws_to_room_code:
+            code = ws_to_room_code.pop(ws)
+            room = rooms.get(code)
+
+            if room:
+                # déterminer qui est l'adversaire
+                opponent_key = "b" if room["a"] is ws else "a"
+                opponent_ws = room.get(opponent_key)
+
+                # notifier l'autre joueur
+                if opponent_ws:
+                    try:
+                        await opponent_ws.send_text(json.dumps({
+                            "type": "opponent_left"
+                        }))
+                    except:
+                        pass
+
+                # fermer la salle
+                try:
+                    rooms.pop(code, None)
+                except:
+                    pass
+
+        # --- ancien code de gestion de lobby_goodbye ---    
+        user_id = ws_to_user_id.pop(ws, None)
+        if user_id:
+            user = lobby_users.pop(user_id, None)
+            if user:
+                delta = {
+                    "type": "presence_delta",
+                    "added": [],
+                    "removed": [user],
+                    "updated": [],
+                }
+                await lobby_broadcast(delta, exclude=ws)
+
     finally:
         # ---------- Nettoyage lobby ----------
         user_id = ws_to_user_id.pop(ws, None)
